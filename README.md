@@ -12,16 +12,18 @@ I built this because I got tired of copy-pasting prompts into ChatGPT's web UI e
 
 ## Install
 
-```bash
-pip install gpt-image
-```
-
-Or grab it straight from the repo:
+Clone the repo and install it locally:
 
 ```bash
 git clone https://github.com/hffmnnj/gpt-image-cli.git
 cd gpt-image-cli
 pip install -e .
+```
+
+That's it. No PyPI package. If you want it globally available, link the binary:
+
+```bash
+ln -sf $(pwd)/.venv/bin/gpt-image ~/.local/bin/gpt-image
 ```
 
 ## First-time login
