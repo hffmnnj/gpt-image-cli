@@ -53,6 +53,16 @@ gpt-image generate \
   --out final.png
 ```
 
+Use reference images for style or content guidance:
+
+```bash
+gpt-image generate \
+  --reference-image ./style.png \
+  --action generate \
+  --prompt "a portrait of a corgi in this style" \
+  --out corgi.png
+```
+
 Transparent background for stickers or overlays:
 
 ```bash
@@ -77,15 +87,23 @@ gpt-image generate --prompt "test" --dry-run
 - `gpt-image auth-status` -- Check if your token is still valid
 - `gpt-image generate` -- Generate or edit an image
 
-## Flags for generate
+## Flags for `generate`
 
 - `--prompt`, `-p` -- What you want to see (required)
 - `--prompt-file` -- Read the prompt from a file instead
-- `--image`, `-i` -- Reference image for editing. You can pass this up to five times
+- `--image`, `-i` -- Input image for editing or context. Repeatable, up to 5
+- `--reference-image`, `-r` -- Alias for attaching style or content reference images. Same API mechanism as `--image`, just clearer intent. Repeatable
+- `--detail` -- Detail level for input images: `low`, `high` (default), `auto`, or `original`. Matches Codex CLI behavior
+- `--action` -- `generate` to create a new image from references, `edit` to modify an existing image, or `auto` to let the model decide (default)
+- `--input-fidelity` -- `low` or `high`. How strongly the model preserves details from input images. Only supported for `gpt-image-1` and `gpt-image-1.5`
+- `--moderation` -- `auto` (default) or `low`
+- `--partial-images` -- Number of partial preview images to stream, from 0 to 3. Default is 0
+- `--output-compression` -- Compression level for the output image, 0 to 100. Default is 100
+- `--input-image-mask` -- Path to a mask image for inpainting
 - `--out`, `-o` -- Where to save the result. Defaults to `output.png`
 - `--model` -- `gpt-image-2` (default) or `gpt-image-1.5`
 - `--responses-model` -- Which model handles the conversation layer. Default is `gpt-5.5`
-- `--size` -- `1024x1024` (default), `1536x1024`, `1024x1536`, or `auto`
+- `--size` -- `1024x1024` (default), `1536x1024`, `1024x1536`, or `auto`. GPT Image 2 also supports custom sizes divisible by 16 up to 3840x2160
 - `--quality` -- `low`, `medium`, `high` (default), or `auto`
 - `--output-format` -- `png` (default), `jpeg`, or `webp`
 - `--background` -- `transparent`, `opaque`, or `auto`. Needs `gpt-image-1.5`

@@ -38,6 +38,10 @@ MAX_BYTES = 64 * 1024 * 1024
 SUPPORTED_QUALITIES = {"low", "medium", "high", "auto"}
 SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp"}
 SUPPORTED_BACKGROUNDS = {"transparent", "opaque", "auto"}
+SUPPORTED_DETAILS = {"low", "high", "auto", "original"}
+SUPPORTED_ACTIONS = {"generate", "edit", "auto"}
+SUPPORTED_FIDELITIES = {"low", "high"}
+SUPPORTED_MODERATIONS = {"auto", "low"}
 
 GPT_IMAGE_2_MIN = 655_360
 GPT_IMAGE_2_MAX = 8_294_400
@@ -72,7 +76,7 @@ def auth_path() -> Path:
 def _headers(content_type: str) -> dict[str, str]:
     return {
         "Content-Type": content_type,
-        "User-Agent": "gpt-image/0.1.0",
+        "User-Agent": "gpt-image/0.2.0",
     }
 
 
@@ -370,6 +374,31 @@ def _validate_background(value: str | None) -> None:
         raise CliError("background must be transparent, opaque, or auto.")
 
 
+def _validate_detail(value: str) -> None:
+    if value not in SUPPORTED_DETAILS:
+        raise CliError("detail must be low, high, auto, or original.")
+
+
+def _validate_action(value: str | None) -> None:
+    if value is not None and value not in SUPPORTED_ACTIONS:
+        raise CliError("action must be generate, edit, or auto.")
+
+
+def _validate_input_fidelity(value: str | None) -> None:
+    if value is not None and value not in SUPPORTED_FIDELITIES:
+        raise CliError("input-fidelity must be low or high.")
+
+
+def _validate_moderation(value: str | None) -> None:
+    if value is not None and value not in SUPPORTED_MODERATIONS:
+        raise CliError("moderation must be auto or low.")
+
+
+def _validate_partial_images(value: int | None) -> None:
+    if value is not None and (value < 0 or value > 3):
+        raise CliError("partial-images must be between 0 and 3.")
+
+
 def _parse_size(value: str) -> tuple[int, int] | None:
     import re
     match = re.fullmatch(r"([1-9][0-9]*)x([1-9][0-9]*)", value)
@@ -422,7 +451,7 @@ def _image_to_data_url(path: Path) -> str:
     return f"data:{_guess_mime(path)};base64,{encoded}"
 
 
-def _build_content(prompt: str, image_paths: list[str]) -> list[dict[str, Any]]:
+def _build_content(prompt: str, image_paths: list[str], detail: str) -> list[dict[str, Any]]:
     if len(image_paths) > MAX_INPUT_IMAGES:
         raise CliError(f"At most {MAX_INPUT_IMAGES} input images are supported.")
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
@@ -430,7 +459,7 @@ def _build_content(prompt: str, image_paths: list[str]) -> list[dict[str, Any]]:
         content.append({
             "type": "input_image",
             "image_url": _image_to_data_url(Path(raw)),
-            "detail": "auto",
+            "detail": detail,
         })
     return content
 
@@ -442,6 +471,11 @@ def _build_body(args: argparse.Namespace, prompt: str, image_paths: list[str]) -
     _validate_quality(args.quality)
     _validate_background(args.background)
     _validate_size(args.size, image_model)
+    _validate_detail(args.detail)
+    _validate_action(args.action)
+    _validate_input_fidelity(args.input_fidelity)
+    _validate_moderation(args.moderation)
+    _validate_partial_images(args.partial_images)
 
     tool: dict[str, Any] = {
         "type": "image_generation",
@@ -453,10 +487,22 @@ def _build_body(args: argparse.Namespace, prompt: str, image_paths: list[str]) -
         tool["output_format"] = _normalize_format(args.output_format)
     if args.background:
         tool["background"] = args.background
+    if args.action:
+        tool["action"] = args.action
+    if args.input_fidelity:
+        tool["input_fidelity"] = args.input_fidelity
+    if args.moderation:
+        tool["moderation"] = args.moderation
+    if args.partial_images is not None:
+        tool["partial_images"] = args.partial_images
+    if args.output_compression is not None:
+        tool["output_compression"] = args.output_compression
+    if args.input_image_mask:
+        tool["input_image_mask"] = {"image_url": _image_to_data_url(Path(args.input_image_mask))}
 
     return {
         "model": args.responses_model,
-        "input": [{"role": "user", "content": _build_content(prompt, image_paths)}],
+        "input": [{"role": "user", "content": _build_content(prompt, image_paths, args.detail)}],
         "instructions": "You are an image generation assistant.",
         "tools": [tool],
         "tool_choice": {"type": "image_generation"},
@@ -475,7 +521,7 @@ def _post_sse(url: str, token: str, body: dict[str, Any], timeout: int) -> str:
             "Authorization": f"Bearer {token}",
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            "User-Agent": "gpt-image/0.1.0",
+            "User-Agent": "gpt-image/0.2.0",
         },
     )
     try:
@@ -702,7 +748,7 @@ def cmd_auth_status(args: argparse.Namespace) -> int:
 
 def cmd_generate(args: argparse.Namespace) -> int:
     prompt = _read_prompt(args.prompt, args.prompt_file)
-    image_paths = args.image or []
+    image_paths = (args.image or []) + (args.reference_image or [])
     if args.count < 1 or args.count > MAX_COUNT:
         raise CliError(f"--count must be between 1 and {MAX_COUNT}.")
     output_format = _normalize_format(args.output_format)
@@ -720,6 +766,18 @@ def cmd_generate(args: argparse.Namespace) -> int:
             "input_images": len(image_paths),
             "count": args.count,
         }
+        if args.action:
+            summary["action"] = args.action
+        if args.input_fidelity:
+            summary["input_fidelity"] = args.input_fidelity
+        if args.moderation:
+            summary["moderation"] = args.moderation
+        if args.partial_images is not None:
+            summary["partial_images"] = args.partial_images
+        if args.output_compression is not None:
+            summary["output_compression"] = args.output_compression
+        if args.input_image_mask:
+            summary["input_image_mask"] = args.input_image_mask
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
@@ -760,7 +818,15 @@ def build_parser() -> argparse.ArgumentParser:
     gen = sub.add_parser("generate", help="Generate or edit an image.")
     gen.add_argument("--prompt", "-p")
     gen.add_argument("--prompt-file")
-    gen.add_argument("--image", "-i", action="append", help="Reference/edit image path. Repeatable.")
+    gen.add_argument("--image", "-i", action="append", help="Input image path (edit target or reference). Repeatable.")
+    gen.add_argument("--reference-image", "-r", action="append", help="Reference image path for style/content guidance. Repeatable. (Same API mechanism as --image.)")
+    gen.add_argument("--detail", default="high", choices=sorted(SUPPORTED_DETAILS), help="Detail level for input images. Default: high (matches Codex CLI default).")
+    gen.add_argument("--action", choices=sorted(SUPPORTED_ACTIONS), help="Whether to generate a new image or edit an existing one. Default: auto.")
+    gen.add_argument("--input-fidelity", choices=sorted(SUPPORTED_FIDELITIES), help="How strongly to preserve details from input images. Only supported for gpt-image-1/1.5.")
+    gen.add_argument("--moderation", choices=sorted(SUPPORTED_MODERATIONS), help="Moderation level for generated images. Default: auto.")
+    gen.add_argument("--partial-images", type=int, help="Number of partial images to stream (0-3). Default: 0.")
+    gen.add_argument("--output-compression", type=int, help="Output compression level (0-100). Default: 100.")
+    gen.add_argument("--input-image-mask", help="Path to a mask image for inpainting/editing.")
     gen.add_argument("--out", "-o", default="output.png")
     gen.add_argument("--model", default=os.getenv("GPT_IMAGE_MODEL", DEFAULT_IMAGE_MODEL))
     gen.add_argument("--responses-model", default=os.getenv("GPT_IMAGE_RESPONSES_MODEL", DEFAULT_RESPONSES_MODEL))
