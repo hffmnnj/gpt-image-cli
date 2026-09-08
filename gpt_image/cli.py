@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPT Image CLI — generate images via ChatGPT OAuth without an API key."""
+"""GPT Image CLI: generate images via ChatGPT OAuth without an API key."""
 
 from __future__ import annotations
 
@@ -24,10 +24,10 @@ OPENAI_AUTH_URL = "https://auth.openai.com"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DEVICE_CALLBACK = f"{OPENAI_AUTH_URL}/deviceauth/callback"
 
-DEFAULT_IMAGE_MODEL = "gpt-image-2"
+DEFAULT_IMAGE_MODEL = "gpt-image-2.5-sunburst"
 DEFAULT_RESPONSES_MODEL = "gpt-5.5"
 DEFAULT_SIZE = "1024x1024"
-DEFAULT_QUALITY = "high"
+DEFAULT_QUALITY = "auto"
 DEFAULT_FORMAT = "png"
 DEFAULT_TIMEOUT = 180
 DEFAULT_COUNT = 1
@@ -35,7 +35,7 @@ MAX_COUNT = 4
 MAX_INPUT_IMAGES = 5
 MAX_BYTES = 64 * 1024 * 1024
 
-SUPPORTED_QUALITIES = {"low", "medium", "high", "auto"}
+SUPPORTED_QUALITIES = {"low", "medium", "high", "xhigh", "max", "auto"}
 SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp"}
 SUPPORTED_BACKGROUNDS = {"transparent", "opaque", "auto"}
 SUPPORTED_DETAILS = {"low", "high", "auto", "original"}
@@ -43,10 +43,14 @@ SUPPORTED_ACTIONS = {"generate", "edit", "auto"}
 SUPPORTED_FIDELITIES = {"low", "high"}
 SUPPORTED_MODERATIONS = {"auto", "low"}
 
-GPT_IMAGE_2_MIN = 655_360
-GPT_IMAGE_2_MAX = 8_294_400
-GPT_IMAGE_2_MAX_EDGE = 3840
-GPT_IMAGE_2_MAX_RATIO = 3.0
+FLEXIBLE_IMAGE_MIN = 655_360
+FLEXIBLE_IMAGE_MAX = 8_294_400
+FLEXIBLE_IMAGE_MAX_EDGE = 3840
+FLEXIBLE_IMAGE_MAX_RATIO = 3.0
+GPT_IMAGE_25_MODEL_PREFIXES = (
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+)
 
 
 class CliError(RuntimeError):
@@ -69,6 +73,18 @@ def die(msg: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+def _is_gpt_image_25_model(model: str) -> bool:
+    return any(model == prefix or model.startswith(f"{prefix}-") for prefix in GPT_IMAGE_25_MODEL_PREFIXES)
+
+
+def _is_gpt_image_2_model(model: str) -> bool:
+    return model == "gpt-image-2" or model.startswith("gpt-image-2-")
+
+
+def _uses_flexible_size(model: str) -> bool:
+    return _is_gpt_image_25_model(model) or _is_gpt_image_2_model(model)
+
+
 def auth_path() -> Path:
     return Path(os.getenv("GPT_IMAGE_AUTH_FILE", DEFAULT_AUTH_FILE)).expanduser()
 
@@ -76,7 +92,7 @@ def auth_path() -> Path:
 def _headers(content_type: str) -> dict[str, str]:
     return {
         "Content-Type": content_type,
-        "User-Agent": "gpt-image/0.2.0",
+        "User-Agent": "gpt-image/0.3.0",
     }
 
 
@@ -364,9 +380,11 @@ def _normalize_format(value: str | None) -> str:
     return "jpeg" if fmt == "jpg" else fmt
 
 
-def _validate_quality(value: str) -> None:
+def _validate_quality(value: str, model: str) -> None:
     if value not in SUPPORTED_QUALITIES:
-        raise CliError("quality must be low, medium, high, or auto.")
+        raise CliError("quality must be low, medium, high, xhigh, max, or auto.")
+    if value in {"xhigh", "max"} and not _is_gpt_image_25_model(model):
+        raise CliError("xhigh and max quality are only supported by GPT Image 2.5 models.")
 
 
 def _validate_background(value: str | None) -> None:
@@ -414,21 +432,21 @@ def _validate_size(size: str, model: str) -> None:
     if parsed is None:
         raise CliError("size must be auto or WIDTHxHEIGHT, for example 1024x1024.")
     width, height = parsed
-    if "gpt-image-2" not in model:
+    if not _uses_flexible_size(model):
         if size not in {"1024x1024", "1536x1024", "1024x1536"}:
             raise CliError("this image model only supports 1024x1024, 1536x1024, 1024x1536, or auto.")
         return
     max_edge = max(width, height)
     min_edge = min(width, height)
     pixels = width * height
-    if max_edge > GPT_IMAGE_2_MAX_EDGE:
-        raise CliError("gpt-image-2 max edge must be <= 3840.")
+    if max_edge > FLEXIBLE_IMAGE_MAX_EDGE:
+        raise CliError("GPT Image 2 and 2.5 max edge must be <= 3840.")
     if width % 16 != 0 or height % 16 != 0:
-        raise CliError("gpt-image-2 width and height must be multiples of 16.")
-    if max_edge / min_edge > GPT_IMAGE_2_MAX_RATIO:
-        raise CliError("gpt-image-2 long-to-short ratio must be <= 3:1.")
-    if pixels < GPT_IMAGE_2_MIN or pixels > GPT_IMAGE_2_MAX:
-        raise CliError("gpt-image-2 total pixels must be between 655,360 and 8,294,400.")
+        raise CliError("GPT Image 2 and 2.5 width and height must be multiples of 16.")
+    if max_edge / min_edge > FLEXIBLE_IMAGE_MAX_RATIO:
+        raise CliError("GPT Image 2 and 2.5 long-to-short ratio must be <= 3:1.")
+    if pixels < FLEXIBLE_IMAGE_MIN or pixels > FLEXIBLE_IMAGE_MAX:
+        raise CliError("GPT Image 2 and 2.5 total pixels must be between 655,360 and 8,294,400.")
 
 
 def _guess_mime(path: Path) -> str:
@@ -466,9 +484,9 @@ def _build_content(prompt: str, image_paths: list[str], detail: str) -> list[dic
 
 def _build_body(args: argparse.Namespace, prompt: str, image_paths: list[str]) -> dict[str, Any]:
     image_model = args.model
-    if args.background == "transparent" and image_model == DEFAULT_IMAGE_MODEL:
+    if args.background == "transparent" and image_model == "gpt-image-2":
         image_model = "gpt-image-1.5"
-    _validate_quality(args.quality)
+    _validate_quality(args.quality, image_model)
     _validate_background(args.background)
     _validate_size(args.size, image_model)
     _validate_detail(args.detail)
@@ -521,7 +539,7 @@ def _post_sse(url: str, token: str, body: dict[str, Any], timeout: int) -> str:
             "Authorization": f"Bearer {token}",
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            "User-Agent": "gpt-image/0.2.0",
+            "User-Agent": "gpt-image/0.3.0",
         },
     )
     try:
@@ -796,7 +814,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate images with GPT Image 2 via ChatGPT OAuth — no API key needed.",
+        description="Generate images with GPT Image 2.5 via ChatGPT OAuth. No API key needed.",
         prog="gpt-image",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -828,12 +846,24 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--output-compression", type=int, help="Output compression level (0-100). Default: 100.")
     gen.add_argument("--input-image-mask", help="Path to a mask image for inpainting/editing.")
     gen.add_argument("--out", "-o", default="output.png")
-    gen.add_argument("--model", default=os.getenv("GPT_IMAGE_MODEL", DEFAULT_IMAGE_MODEL))
+    gen.add_argument(
+        "--model",
+        default=os.getenv("GPT_IMAGE_MODEL", DEFAULT_IMAGE_MODEL),
+        help="Image model. Default: gpt-image-2.5-sunburst. Flare, dated 2.5 snapshots, gpt-image-2, and gpt-image-1.5 are also accepted.",
+    )
     gen.add_argument("--responses-model", default=os.getenv("GPT_IMAGE_RESPONSES_MODEL", DEFAULT_RESPONSES_MODEL))
     gen.add_argument("--size", default=DEFAULT_SIZE)
-    gen.add_argument("--quality", default=DEFAULT_QUALITY)
+    gen.add_argument(
+        "--quality",
+        default=DEFAULT_QUALITY,
+        help="Quality: low, medium, high, xhigh, max, or auto. Default: auto.",
+    )
     gen.add_argument("--output-format", default=DEFAULT_FORMAT)
-    gen.add_argument("--background", choices=sorted(SUPPORTED_BACKGROUNDS))
+    gen.add_argument(
+        "--background",
+        choices=sorted(SUPPORTED_BACKGROUNDS),
+        help="Background mode. GPT Image 2.5 supports transparent PNG/WebP output.",
+    )
     gen.add_argument("--count", type=int, default=DEFAULT_COUNT)
     gen.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     gen.add_argument("--base-url", default=None)
