@@ -8,12 +8,14 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sys
 import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -55,6 +57,44 @@ GPT_IMAGE_25_MODEL_PREFIXES = (
 
 class CliError(RuntimeError):
     pass
+
+
+class RateLimitRejection(CliError):
+    def __init__(self, message: str, retry_after: str | None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _rate_limit_retry_after(exc: error.HTTPError, detail: bytes) -> tuple[bool, str | None]:
+    """Recognize only a complete, explicit rate denial before the response stream."""
+    if exc.code != 429 or len(detail) > 4096:
+        return False, None
+    try:
+        payload = json.loads(detail)
+        info = payload["error"]
+        if not isinstance(info, dict):
+            return False, None
+        kind, code = info.get("type"), info.get("code")
+        if kind == "insufficient_quota" or code == "insufficient_quota":
+            return False, None
+        if code != "rate_limit_exceeded" and not (
+            code is None and kind == "rate_limit_exceeded"
+        ):
+            return False, None
+    except (ValueError, KeyError, TypeError):
+        return False, None
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if retry_after is not None:
+        if len(retry_after) > 128 or not retry_after.isascii():
+            return False, None
+        if not re.fullmatch(r"[0-9]{1,9}", retry_after):
+            try:
+                date = parsedate_to_datetime(retry_after)
+                if date.tzinfo is None:
+                    return False, None
+            except (ValueError, TypeError, OverflowError):
+                return False, None
+    return True, retry_after
 
 
 @dataclass
@@ -543,7 +583,19 @@ def _post_sse(url: str, token: str, body: dict[str, Any], timeout: int) -> str:
         },
     )
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
+        resp = request.urlopen(req, timeout=timeout)
+    except error.HTTPError as exc:
+        raw = exc.read(4097)
+        detail = raw[:4096].decode("utf-8", errors="replace")
+        message = f"Request failed (HTTP {exc.code}): {detail}"
+        rate_limited, retry_after = _rate_limit_retry_after(exc, raw)
+        if rate_limited:
+            raise RateLimitRejection(message, retry_after) from exc
+        raise CliError(message) from exc
+    except error.URLError as exc:
+        raise CliError(f"Request failed: {exc.reason}") from exc
+    try:
+        with resp:
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -555,9 +607,6 @@ def _post_sse(url: str, token: str, body: dict[str, Any], timeout: int) -> str:
                     raise CliError("Response exceeded size limit.")
                 chunks.append(chunk)
             return b"".join(chunks).decode("utf-8", errors="replace")
-    except error.HTTPError as exc:
-        detail = exc.read(4096).decode("utf-8", errors="replace")
-        raise CliError(f"Request failed (HTTP {exc.code}): {detail}") from exc
     except error.URLError as exc:
         raise CliError(f"Request failed: {exc.reason}") from exc
 
@@ -769,6 +818,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
     image_paths = (args.image or []) + (args.reference_image or [])
     if args.count < 1 or args.count > MAX_COUNT:
         raise CliError(f"--count must be between 1 and {MAX_COUNT}.")
+    if args.error_json and args.count != 1:
+        raise CliError("--error-json requires --count 1.")
     output_format = _normalize_format(args.output_format)
     url = _response_url(args.base_url)
     body = _build_body(args, prompt, image_paths)
@@ -870,6 +921,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--login-if-missing", action="store_true")
     gen.add_argument("--open-browser", action="store_true")
     gen.add_argument("--dry-run", action="store_true")
+    gen.add_argument("--error-json", action="store_true", help="Emit sanitized structured errors for one image request.")
     gen.set_defaults(func=cmd_generate)
 
     return parser
@@ -881,6 +933,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args) or 0)
     except CliError as exc:
+        if getattr(args, "error_json", False):
+            if isinstance(exc, RateLimitRejection):
+                eprint(json.dumps({"version": 1, "kind": "rate_limit_rejected", "status": 429, "retry_after": exc.retry_after}))
+            else:
+                eprint(json.dumps({"version": 1, "kind": "failed"}))
+            return 1
         die(str(exc))
     return 0
 
