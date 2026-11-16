@@ -74,8 +74,12 @@ def _rate_limit_retry_after(exc: error.HTTPError, detail: bytes) -> tuple[bool, 
         info = payload["error"]
         if not isinstance(info, dict):
             return False, None
-        codes = [info[key] for key in ("type", "code") if info.get(key) is not None]
-        if not codes or any(code != "rate_limit_exceeded" for code in codes):
+        kind, code = info.get("type"), info.get("code")
+        if kind == "insufficient_quota" or code == "insufficient_quota":
+            return False, None
+        if code != "rate_limit_exceeded" and not (
+            code is None and kind == "rate_limit_exceeded"
+        ):
             return False, None
     except (ValueError, KeyError, TypeError):
         return False, None

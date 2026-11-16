@@ -98,6 +98,20 @@ class ErrorTransportTests(unittest.TestCase):
         self.assertTrue(result.stderr.startswith("Error: Request failed (HTTP 429):"))
         self.assertEqual(FakeProvider.calls, 1)
 
+    def test_bucketed_rate_limits_preserve_retry_interval(self):
+        for kind in ("requests", "tokens"):
+            with self.subTest(kind=kind):
+                FakeProvider.body = json.dumps({
+                    "error": {"type": kind, "code": "rate_limit_exceeded"},
+                }).encode()
+                result = self.invoke("--error-json")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(json.loads(result.stderr), {
+                    "version": 1, "kind": "rate_limit_rejected",
+                    "status": 429, "retry_after": "7",
+                })
+        self.assertEqual(FakeProvider.calls, 2)
+
     def test_optional_and_http_date_retry_after_are_preserved(self):
         for header in (None, "Wed, 21 Oct 2037 07:28:00 GMT"):
             with self.subTest(header=header):
