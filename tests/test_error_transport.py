@@ -14,6 +14,7 @@ class FakeProvider(BaseHTTPRequestHandler):
     body = b'{"error":{"type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}'
     retry_after = "7"
     calls = 0
+    stream_wait = None
 
     def do_POST(self):
         type(self).calls += 1
@@ -23,6 +24,9 @@ class FakeProvider(BaseHTTPRequestHandler):
             self.send_header("Retry-After", type(self).retry_after)
         self.end_headers()
         self.wfile.write(type(self).body)
+        if type(self).stream_wait is not None:
+            self.wfile.flush()
+            type(self).stream_wait.wait(4)
 
     def log_message(self, *args):
         pass
@@ -51,6 +55,7 @@ class ErrorTransportTests(unittest.TestCase):
         FakeProvider.body = b'{"error":{"type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}'
         FakeProvider.retry_after = "7"
         FakeProvider.calls = 0
+        FakeProvider.stream_wait = None
 
     def invoke(self, *extra):
         return subprocess.run(
@@ -89,8 +94,58 @@ class ErrorTransportTests(unittest.TestCase):
                 FakeProvider.status, FakeProvider.body, FakeProvider.retry_after = status, body, header
                 result = self.invoke("--error-json")
                 self.assertEqual(result.returncode, 1)
-                self.assertEqual(json.loads(result.stderr), {"version": 1, "kind": "failed"})
+                diagnostic = ({"stage": "provider", "kind": "failed"} if status == 200 else
+                              {"stage": "provider", "kind": "rejected", "status": status})
+                self.assertEqual(json.loads(result.stderr), {
+                    "version": 1, "kind": "failed", "diagnostic": diagnostic,
+                })
         self.assertEqual(FakeProvider.calls, len(cases))
+
+    def test_http_503_is_sanitized_and_not_retried(self):
+        FakeProvider.status = 503
+        FakeProvider.body = b'{"error":{"message":"secret-provider-body https://private.invalid"}}'
+        FakeProvider.retry_after = "secret-header"
+        result = self.invoke("--error-json")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr), {
+            "version": 1, "kind": "failed",
+            "diagnostic": {"stage": "provider", "kind": "rejected", "status": 503},
+        })
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(FakeProvider.calls, 1)
+
+    def test_stream_timeout_is_sanitized_and_not_retried(self):
+        FakeProvider.status = 200
+        FakeProvider.body = b'data: {"secret":"provider-body"}\n\n'
+        FakeProvider.stream_wait = threading.Event()
+        try:
+            result = self.invoke("--error-json", "--timeout", "1")
+        finally:
+            FakeProvider.stream_wait.set()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr), {
+            "version": 1, "kind": "failed",
+            "diagnostic": {"stage": "provider", "kind": "timeout"},
+        })
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(FakeProvider.calls, 1)
+
+    def test_output_failures_are_sanitized(self):
+        FakeProvider.status = 200
+        for body, output, kind in (
+            (b'data: {"type":"response.completed","response":{"output":[]}}\n\n', "image.png", "invalid"),
+            (b'data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"a"}}\n\n', "image.png", "invalid"),
+            (b'data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"YWJj"}}\n\n', ".", "failed"),
+        ):
+            with self.subTest(kind=kind, output=output):
+                FakeProvider.body = body
+                result = self.invoke("--error-json", "--out", str(self.root / output))
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(json.loads(result.stderr), {
+                    "version": 1, "kind": "failed",
+                    "diagnostic": {"stage": "output", "kind": kind},
+                })
+        self.assertEqual(FakeProvider.calls, 3)
 
     def test_default_error_remains_human_readable(self):
         result = self.invoke()

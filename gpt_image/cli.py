@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import http.client
 import json
 import mimetypes
 import os
@@ -17,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib import error, parse, request
 
 DEFAULT_AUTH_FILE = "~/.gpt-image/auth.json"
@@ -55,8 +57,23 @@ GPT_IMAGE_25_MODEL_PREFIXES = (
 )
 
 
+@dataclass(frozen=True)
+class Diagnostic:
+    stage: Literal["provider", "output"]
+    kind: Literal["timeout", "unavailable", "invalid", "failed", "rejected"]
+    status: int | None = None
+
+    def as_dict(self) -> dict[str, str | int]:
+        result: dict[str, str | int] = {"stage": self.stage, "kind": self.kind}
+        if self.status is not None and 100 <= self.status <= 599:
+            result["status"] = self.status
+        return result
+
+
 class CliError(RuntimeError):
-    pass
+    def __init__(self, message: str, diagnostic: Diagnostic | None = None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class RateLimitRejection(CliError):
@@ -591,9 +608,10 @@ def _post_sse(url: str, token: str, body: dict[str, Any], timeout: int) -> str:
         rate_limited, retry_after = _rate_limit_retry_after(exc, raw)
         if rate_limited:
             raise RateLimitRejection(message, retry_after) from exc
-        raise CliError(message) from exc
+        raise CliError(message, Diagnostic("provider", "rejected", exc.code)) from exc
     except error.URLError as exc:
-        raise CliError(f"Request failed: {exc.reason}") from exc
+        kind = "timeout" if isinstance(exc.reason, TimeoutError) else "unavailable"
+        raise CliError(f"Request failed: {exc.reason}", Diagnostic("provider", kind)) from exc
     try:
         with resp:
             chunks: list[bytes] = []
@@ -604,11 +622,12 @@ def _post_sse(url: str, token: str, body: dict[str, Any], timeout: int) -> str:
                     break
                 total += len(chunk)
                 if total > MAX_BYTES:
-                    raise CliError("Response exceeded size limit.")
+                    raise CliError("Response exceeded size limit.", Diagnostic("provider", "failed"))
                 chunks.append(chunk)
             return b"".join(chunks).decode("utf-8", errors="replace")
     except error.URLError as exc:
-        raise CliError(f"Request failed: {exc.reason}") from exc
+        kind = "timeout" if isinstance(exc.reason, TimeoutError) else "unavailable"
+        raise CliError(f"Request failed: {exc.reason}", Diagnostic("provider", kind)) from exc
 
 
 def _parse_sse(body: str) -> list[dict[str, Any]]:
@@ -637,7 +656,7 @@ def _extract_images(body: str) -> list[tuple[str, str | None]]:
                 message = error_obj.get("message") or error_obj.get("code")
             else:
                 message = event.get("message")
-            raise CliError(str(message or "Image generation failed."))
+            raise CliError(str(message or "Image generation failed."), Diagnostic("provider", "failed"))
 
     payloads: list[tuple[str, str | None]] = []
     for event in events:
@@ -672,7 +691,7 @@ def _extract_images(body: str) -> list[tuple[str, str | None]]:
 
 def _write_images(payloads: list[tuple[str, str | None]], out: str, output_format: str) -> list[Path]:
     if not payloads:
-        raise CliError("No image payload found in response.")
+        raise CliError("No image payload found in response.", Diagnostic("output", "invalid"))
     target = Path(out)
     target.parent.mkdir(parents=True, exist_ok=True)
     ext = "jpg" if output_format == "jpeg" else output_format
@@ -854,9 +873,22 @@ def cmd_generate(args: argparse.Namespace) -> int:
     all_payloads: list[tuple[str, str | None]] = []
     start = time.time()
     for _ in range(args.count):
-        text = _post_sse(url, auth.access_token, dict(body), args.timeout)
+        try:
+            text = _post_sse(url, auth.access_token, dict(body), args.timeout)
+        except (OSError, http.client.IncompleteRead) as exc:
+            if not args.error_json:
+                raise
+            kind = ("timeout" if isinstance(exc, TimeoutError) else
+                    "unavailable" if isinstance(exc, ConnectionError) else "failed")
+            raise CliError("Provider request failed.", Diagnostic("provider", kind)) from exc
         all_payloads.extend(_extract_images(text))
-    written = _write_images(all_payloads, args.out, output_format)
+    try:
+        written = _write_images(all_payloads, args.out, output_format)
+    except (binascii.Error, ValueError, OSError) as exc:
+        if not args.error_json:
+            raise
+        kind = "failed" if isinstance(exc, OSError) else "invalid"
+        raise CliError("Image output failed.", Diagnostic("output", kind)) from exc
     for path in written:
         print(path)
     eprint(f"Generated {len(written)} image(s) in {time.time() - start:.1f}s.")
@@ -937,7 +969,10 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(exc, RateLimitRejection):
                 eprint(json.dumps({"version": 1, "kind": "rate_limit_rejected", "status": 429, "retry_after": exc.retry_after}))
             else:
-                eprint(json.dumps({"version": 1, "kind": "failed"}))
+                payload: dict[str, Any] = {"version": 1, "kind": "failed"}
+                if exc.diagnostic is not None:
+                    payload["diagnostic"] = exc.diagnostic.as_dict()
+                eprint(json.dumps(payload))
             return 1
         die(str(exc))
     return 0
